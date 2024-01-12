@@ -6,17 +6,8 @@ def terminal(board):
         return True
     return False
 
-def result(board, move):
-    # Copy the original board
-    new_board = board.copy()
 
-    # Apply the move to the new board
-    new_board.push(move)
-
-    return new_board
-
-
-CHECKMATE_SCORE = 10000  # A large value for checkmate
+CHECKMATE_SCORE = 100  # A large value for checkmate
 
 def evaluate_board(board):
     # Check for game-ending conditions
@@ -42,8 +33,25 @@ def evaluate_board(board):
     normalized_score = score / CHECKMATE_SCORE
     return max(min(normalized_score, 1), -1)
 
+def evaluate_move(board, move):
+    """
+    Evaluate the given move.
+    This function can be as complex as needed, considering various chess strategies.
+    """
+    # Example: Prioritize captures
+    if board.is_capture(move):
+        return 10
+    else:
+        return 0
 
-def minimax(board):
+def sort_moves(board):
+    legal_moves = list(board.legal_moves)
+    scored_moves = [(move, evaluate_move(board, move)) for move in legal_moves]
+    scored_moves.sort(key=lambda x: x[1], reverse=True)  # Sort by score in descending order
+    sorted_moves = [move for move, score in scored_moves]
+    return sorted_moves
+
+def minimax(board, depth):
     """
     Returns the optimal action for the current player on the board.
     """
@@ -55,8 +63,7 @@ def minimax(board):
         if terminal(board=board) or depth <= 0:
             return evaluate_board(board=board), None
         
-        legal_moves = list(board.legal_moves)
-        random.shuffle(legal_moves)
+        legal_moves = sort_moves(board)
 
         if board.turn == chess.WHITE:  # Maximizing player
             value = float('-inf')
@@ -65,7 +72,7 @@ def minimax(board):
             for action in legal_moves:
                 new_board = board.copy()
                 new_board.push(action)
-                score, _ = optimize(new_board, depth -1, alpha, beta)
+                score, _ = optimize(new_board, depth=depth -1, alpha=alpha, beta=beta)
                 if score > value:
                     value = score
                     optimal_action = action
@@ -79,7 +86,7 @@ def minimax(board):
             for action in legal_moves:
                 new_board = board.copy()
                 new_board.push(action)
-                score, _ = optimize(new_board, depth - 1, alpha, beta)
+                score, _ = optimize(new_board, depth=depth - 1, alpha=alpha, beta=beta)
                 if score < value:
                     value = score
                     optimal_action = action
@@ -89,4 +96,4 @@ def minimax(board):
             return value, optimal_action
 
     
-    return optimize(board)[1]
+    return optimize(board, depth=depth)[1]

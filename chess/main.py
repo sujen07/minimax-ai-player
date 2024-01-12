@@ -1,5 +1,6 @@
 import time
 import chess
+import slider
 import minimax
 import pygame
 pygame.init()
@@ -77,7 +78,7 @@ def draw_board_and_pieces(screen, board, pieces, selected_piece, blink_timer, la
 
 
 
-def run_game(player=chess.WHITE):
+def run_game(player=chess.BLACK, ai_skill=5):
     last_ai_move = None
     board = chess.Board()
     # Initialize chess board
@@ -96,7 +97,7 @@ def run_game(player=chess.WHITE):
             if player != board.turn:
                 time.sleep(0.5)
                 start = time.time()
-                move = minimax.minimax(board)
+                move = minimax.minimax(board, depth=int(ai_skill))
                 board.push(move)
                 last_ai_move = move
                 end_time = time.time()
@@ -148,6 +149,8 @@ def restart_and_select_screen(screen):
     exit_button = pygame.Rect(200, 250, 200, 50)
     white_button = pygame.Rect(150, 350, 100, 50)
     black_button = pygame.Rect(350, 350, 100, 50)
+    ai_skill_slider = slider.Slider(150, 450, 300, 20, 1, 10, 5)
+    font = pygame.font.Font(None, 24)
 
     while running:
         # Clear the screen with a background color (e.g., white)
@@ -170,38 +173,42 @@ def restart_and_select_screen(screen):
         screen.blit(white_text, (white_button.x + 20, white_button.y + 10))
         screen.blit(black_text, (black_button.x + 20, black_button.y + 10))
 
+        ai_skill_slider.draw(screen, font)
+
         # Update the display
         pygame.display.flip()
 
         # Event handling
         for event in pygame.event.get():
+            ai_skill_slider.handle_event(event)
             if event.type == pygame.QUIT:
                 pygame.quit()
                 exit()
             if event.type == pygame.MOUSEBUTTONDOWN:
                 x, y = event.pos
                 if play_button.collidepoint(x, y):
-                    return True, None
+                    return True, None, ai_skill_slider.val
                 elif exit_button.collidepoint(x, y):
                     pygame.quit()
                     exit()
                 elif white_button.collidepoint(x, y):
-                    return True, chess.WHITE
+                    return True, chess.WHITE, ai_skill_slider.val
                 elif black_button.collidepoint(x, y):
-                    return True, chess.BLACK
+                    return True, chess.BLACK, ai_skill_slider.val
 
-    return False, None
+    return False, None, ai_skill_slider.val
 
 
 def main():
     while True:
-        restart, player = restart_and_select_screen(screen)
+        restart, player, ai_skill_lvl = restart_and_select_screen(screen)
+        print(ai_skill_lvl)
         if not restart:
             break
         if not player:
-            run_game()
+            run_game(ai_skill=ai_skill_lvl)
         else:
-            run_game(player=player)
+            run_game(player=player, ai_skill=ai_skill_lvl)
 
 if __name__ == '__main__':
     main()

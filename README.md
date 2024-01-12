@@ -48,8 +48,11 @@ The algorithm is much more time consuming on a game like chess with many more po
 
 
 ## Screenshots
+
 ### Chess
+![chess](images/chess.png)
 
 ### Tic-Tac-Toe
+![Tic Tac Toe](images/tictactoe.png)
 
 

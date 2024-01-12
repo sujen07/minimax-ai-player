@@ -50,7 +50,7 @@ The algorithm is much more time consuming on a game like chess with many more po
 ## Screenshots
 
 ### Chess
-![chess](images/chess.png)
+<img src="images/chess_gameplay.jpg" alt="Chess Gameplay" width="500"/>
 
 ### Tic-Tac-Toe
 ![Tic Tac Toe](images/tictactoe.png)

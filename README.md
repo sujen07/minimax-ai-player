@@ -23,8 +23,9 @@ Navigate to the `chess` directory and install the requirements:
 ```bash
 cd chess
 pip install -r requirements.txt
+```
 
-Usage
+####Usage
 To play the games, run the main.py file in the respective game directory.
 
 Chess

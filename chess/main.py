@@ -29,7 +29,7 @@ def draw_dotted_square(screen, col, row, color):
         pygame.draw.line(screen, color, (square.left + i, square.top), (square.left + i, square.bottom), 1)
         pygame.draw.line(screen, color, (square.left, square.top + i), (square.right, square.top + i), 1)
 
-def draw_board_and_pieces(screen, board, pieces, selected_piece, blink_timer, last_ai_move, possible_moves):
+def draw_board_and_pieces(screen, board, pieces, selected_piece, blink_timer, last_ai_move, possible_moves, player):
     colors = [pygame.Color("white"), pygame.Color("gray")]
     highlight_color = pygame.Color("blue")  # Color for highlighting the selected piece
     check_color = pygame.Color("red")       # Color for highlighting the king in check
@@ -39,8 +39,12 @@ def draw_board_and_pieces(screen, board, pieces, selected_piece, blink_timer, la
     # Draw squares on the board
     for r in range(8):
         for c in range(8):
-            color = colors[(r + c) % 2]
-            square = pygame.Rect(c*75, r*75, 75, 75)
+            if player == chess.WHITE:
+                draw_r, draw_c = 7 - r, c
+            else:
+                draw_r, draw_c = r, 7 - c
+            color = colors[(draw_r + draw_c) % 2]
+            square = pygame.Rect(draw_c * 75, draw_r * 75, 75, 75)
             pygame.draw.rect(screen, color, square)
 
             # Highlight the selected piece
@@ -62,26 +66,32 @@ def draw_board_and_pieces(screen, board, pieces, selected_piece, blink_timer, la
     for i in range(64):
         piece = board.piece_at(i)
         if piece:
-            row, col = divmod(i, 8)
-            screen.blit(pieces[piece.symbol()], (col*75, row*75))
+            original_row, original_col = divmod(i, 8)
+            draw_row, draw_col = (7 - original_row, original_col) if player == chess.WHITE else (original_row, 7 - original_col)
+            screen.blit(pieces[piece.symbol()], (draw_col * 75, draw_row * 75))
+
+    # Highlight possible moves
+    if possible_moves:
+        for move in possible_moves:
+            end_square = move.to_square
+            original_row, original_col = divmod(end_square, 8)
+            draw_row, draw_col = (7 - original_row, original_col) if player == chess.WHITE else (original_row, 7 - original_col)
+            draw_dotted_square(screen, draw_col, draw_row, pygame.Color("green"))
+
     if last_ai_move:
         start_square = last_ai_move.from_square
         end_square = last_ai_move.to_square
         for square in [start_square, end_square]:
             row, col = divmod(square, 8)
+            col = 7 - col
+            if player == chess.WHITE:
+                row, col = 7 - row, 7 - col  # Flip the board for white player
             pygame.draw.rect(screen, pygame.Color("yellow"), pygame.Rect(col*75, row*75, 75, 75), 5)
-    if possible_moves:
-        for move in possible_moves:
-            end_square = move.to_square
-            row, col = divmod(end_square, 8)
-            draw_dotted_square(screen, col, row, move_highlight_color)
 
-
-
-def run_game(player=chess.BLACK, ai_skill=5):
+def run_game(player=chess.WHITE, ai_skill=5):
     last_ai_move = None
-    board = chess.Board()
     # Initialize chess board
+    global board
     board = chess.Board()
 
     # Variables to keep track of the game state
@@ -107,8 +117,12 @@ def run_game(player=chess.BLACK, ai_skill=5):
             if event.type == pygame.MOUSEBUTTONDOWN:
                 # Get mouse position and convert it to board coordinates
                 x, y = event.pos
-                col = x // 75
-                row = y // 75
+                if player == chess.WHITE:
+                    col = (x // 75)
+                    row = 7 - (y // 75)
+                else:
+                    col = 7 - (x // 75)
+                    row = y // 75
                 square = chess.square(col, row)
 
                 if selected_piece is None:
@@ -127,6 +141,7 @@ def run_game(player=chess.BLACK, ai_skill=5):
                         board.push(move)
                     selected_piece = None
                     possible_moves = []
+
             if board.is_checkmate():
                 print("Checkmate! Game over.")
                 running = False  # or handle the end of the game as you prefer
@@ -134,7 +149,7 @@ def run_game(player=chess.BLACK, ai_skill=5):
                 print("Stalemate! Game over.")
                 running = False
         # Draw the board and pieces
-        draw_board_and_pieces(screen, board, pieces, selected_piece, blink_timer=1, last_ai_move=last_ai_move, possible_moves=possible_moves)
+        draw_board_and_pieces(screen, board, pieces, selected_piece, blink_timer=1, last_ai_move=last_ai_move, possible_moves=possible_moves, player=player)
 
         # Update the display
         pygame.display.flip()
@@ -170,8 +185,8 @@ def restart_and_select_screen(screen):
 
         screen.blit(play_text, (play_button.x + 70, play_button.y + 10))
         screen.blit(exit_text, (exit_button.x + 70, exit_button.y + 10))
-        screen.blit(white_text, (white_button.x + 20, white_button.y + 10))
-        screen.blit(black_text, (black_button.x + 20, black_button.y + 10))
+        screen.blit(white_text, (black_button.x + 20, black_button.y + 10))
+        screen.blit(black_text, (white_button.x + 20, white_button.y + 10))
 
         ai_skill_slider.draw(screen, font)
 
@@ -206,9 +221,9 @@ def main():
         if not restart:
             break
         if not player:
-            run_game(ai_skill=ai_skill_lvl)
+            run_game(player=chess.WHITE,ai_skill=ai_skill_lvl)
         else:
-            run_game(player=player, ai_skill=ai_skill_lvl)
+            run_game(player=chess.BLACK, ai_skill=ai_skill_lvl)
 
 if __name__ == '__main__':
     main()

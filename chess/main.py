@@ -1,9 +1,14 @@
 import time
+from pathlib import Path
+
 import chess
 import slider
 import minimax
 import pygame
 pygame.init()
+
+CHESS_DIR = Path(__file__).resolve().parent
+PIECES_DIR = CHESS_DIR / "pieces-basic-svg"
 
 size = (600, 600)  # Size of the window
 screen = pygame.display.set_mode(size)
@@ -16,7 +21,7 @@ def load_pieces():
             piece_name = name[0].upper()
         else:
             piece_name = name[0].lower()
-        image = pygame.image.load(f'pieces-basic-svg/{name}.svg')
+        image = pygame.image.load(str(PIECES_DIR / f'{name}.svg'))
         pieces[piece_name] = pygame.transform.scale(image, (75, 75))
         
     return pieces

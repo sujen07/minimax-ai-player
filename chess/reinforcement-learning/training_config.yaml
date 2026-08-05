@@ -1,0 +1,54 @@
+model:
+  channels: 96
+  num_blocks: 8
+  value_head_channels: 32
+  value_hidden: 256
+
+optimizer:
+  lr: 0.0005
+  min_lr: 0.00005
+  warmup_games: 2000
+  weight_decay: 0.0001
+
+replay:
+  buffer_capacity: 250000
+  train_batch_size: 512
+  min_buffer_size: 5000
+  replay_path: checkpoints_v3/replay_buffer.pt
+  replay_save_every: 50
+
+checkpoint:
+  checkpoint_dir: checkpoints_v3
+  checkpoint_every: 10
+  checkpoint_keep: 10
+  resume: checkpoints_v3/latest.pt
+  model_out: chess_rl_model_v3.pt
+
+runtime:
+  seed: 2026
+  disable_amp: false
+
+common:
+  episodes: 500000
+  games_per_batch: 16
+  num_simulations: 64
+  c_puct: 1.41
+  temp_threshold: 30
+  dirichlet_alpha: 0.3
+  dirichlet_eps: 0.25
+  epochs_per_batch: 2
+  value_coef: 1.0
+  max_moves: 240
+  avoid_training_repetitions: true
+  # A clearly losing side may still learn to claim a repetition draw.
+  repetition_value_threshold: -0.25
+
+# Settings used only by train.py.
+single_process:
+  no_visualize: true
+  move_delay: 0.1
+
+# Settings used only by multiprocess_train.py.
+multiprocess:
+  # Leave null to use max(1, cpu_count() - 2).
+  num_workers: null

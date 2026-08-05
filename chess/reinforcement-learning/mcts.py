@@ -45,7 +45,9 @@ def expand_batch(model, nodes, device=None):
         probs = torch.softmax(masked_logits, dim=0)
         for move in node.board.legal_moves:
             prior = probs[move_to_index(move, node.board)].item()
-            next_board = node.board.copy()
+            # Repetition only depends on reversible history. Preserve that
+            # bounded suffix so tree search sees the same draw rules as play.
+            next_board = node.board.copy(stack=node.board.halfmove_clock)
             next_board.push(move)
             node.children[move] = Node(next_board, parent=node, action=move, prior=prior)
 
@@ -116,9 +118,12 @@ def backpropagate(node, value):
         node = node.parent
 
 
-def visit_distribution(root, temperature=1.0):
+def visit_distribution(root, temperature=1.0, excluded_moves=None):
     """root's legal moves and their probabilities, derived from visit counts."""
-    moves = list(root.children.keys())
+    excluded_moves = excluded_moves or set()
+    moves = [move for move in root.children if move not in excluded_moves]
+    if not moves:
+        moves = list(root.children.keys())
     visits = np.array([root.children[m].visits for m in moves], dtype=np.float64)
 
     if temperature == 0:
@@ -126,22 +131,50 @@ def visit_distribution(root, temperature=1.0):
         probs[np.argmax(visits)] = 1.0
     else:
         scaled = visits ** (1.0 / temperature)
-        probs = scaled / scaled.sum()
+        total = scaled.sum()
+        probs = scaled / total if total > 0 else np.full_like(scaled, 1 / len(scaled))
 
     return moves, probs
 
 
-def policy_target(root, temperature=1.0):
-    """POLICY_SIZE-length training target: visit-count distribution over policy indices."""
-    moves, probs = visit_distribution(root, temperature)
-    target = torch.zeros(POLICY_SIZE)
+def policy_target(root, temperature=1.0, excluded_moves=None):
+    """Sparse visit-count target over the versioned policy action space."""
+    moves, probs = visit_distribution(root, temperature, excluded_moves)
+    by_index = {}
     for move, p in zip(moves, probs):
-        # += (not =) because under-promotions to different pieces share one index.
-        target[move_to_index(move, root.board)] += p
-    return target
+        index = move_to_index(move, root.board)
+        by_index[index] = by_index.get(index, 0.0) + float(p)
+    return SparsePolicy(
+        indices=torch.tensor(list(by_index), dtype=torch.int64),
+        probabilities=torch.tensor(list(by_index.values()), dtype=torch.float32),
+    )
 
 
-def select_move(root, temperature=1.0):
-    moves, probs = visit_distribution(root, temperature)
+def select_move(root, temperature=1.0, excluded_moves=None):
+    moves, probs = visit_distribution(root, temperature, excluded_moves)
     idx = np.random.choice(len(moves), p=probs)
     return moves[idx]
+
+
+def training_repetition_exclusions(root, value_threshold=-0.25):
+    """Moves to suppress in self-play targets, never in deployed inference.
+
+    A draw remains available when MCTS considers the mover clearly worse, and
+    the filter is disabled if every legal continuation repeats.
+    """
+    if root.value_mean() < value_threshold:
+        return set()
+    repetition_claims = {
+        move
+        for move, child in root.children.items()
+        # claim_draw=True ends self-play as soon as the opponent can claim on
+        # their next move, so suppress both an existing third occurrence and
+        # a move that hands the opponent that immediate claim.
+        if child.board.is_repetition(3)
+        or child.board.can_claim_threefold_repetition()
+    }
+    return (
+        repetition_claims
+        if len(repetition_claims) < len(root.children)
+        else set()
+    )

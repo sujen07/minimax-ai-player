@@ -1,14 +1,32 @@
 import sys
 import time
+import json
+import random
 from collections import Counter, deque
 from pathlib import Path
 
 import chess
+import numpy as np
 import torch
-from model import PolicyNetwork
+from model import MODEL_VERSION, PolicyNetwork
 from chess_environment import *
-from mcts import mcts_search_batch, policy_target, select_move
+from mcts import (
+    mcts_search_batch,
+    policy_target,
+    select_move,
+    training_repetition_exclusions,
+)
 from replay_buffer import ReplayBuffer
+from training_config import DEFAULT_CONFIG_PATH, load_training_config
+from training_runtime import (
+    apply_lr_schedule,
+    config_fingerprint,
+    load_replay_buffer,
+    make_grad_scaler,
+    save_replay_buffer,
+    seed_everything,
+    train_batch,
+)
 
 CHESS_DIR = Path(__file__).resolve().parent.parent
 RL_DIR = Path(__file__).resolve().parent
@@ -56,25 +74,64 @@ def _draw_position(board, last_move=None, caption=None):
     ui.pygame.display.flip()
 
 
-def save_checkpoint(path, policy, optimizer, games_done, results_window):
+def save_checkpoint(
+    path,
+    policy,
+    optimizer,
+    games_done,
+    results_window,
+    scaler=None,
+    replay_path=None,
+    resolved_config=None,
+):
     """Persist full training state so a run can be resumed later."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
+            **policy.checkpoint_metadata(),
             "policy_state_dict": policy.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
+            "scaler_state_dict": scaler.state_dict() if scaler is not None else None,
             "games_done": games_done,
             "results_window": list(results_window),
+            "replay_path": str(replay_path) if replay_path is not None else None,
+            "resolved_config": resolved_config,
+            "config_fingerprint": (
+                config_fingerprint(resolved_config) if resolved_config else None
+            ),
+            "python_rng_state": random.getstate(),
+            "numpy_rng_state": np.random.get_state(),
+            "torch_rng_state": torch.get_rng_state(),
+            "cuda_rng_state": (
+                torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+            ),
         },
         path,
     )
 
 
-def load_checkpoint(path, policy, optimizer=None, device=None):
+def load_checkpoint(path, policy, optimizer=None, device=None, scaler=None):
     """Restore training state saved by save_checkpoint. Returns a metadata dict."""
     device = device or torch.device("cpu")
-    ckpt = torch.load(path, map_location=device)
+    # Always unpickle on CPU so ByteTensor RNG states are not remapped to CUDA.
+    ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    expected_metadata = policy.checkpoint_metadata()
+    if ckpt.get("model_version") != MODEL_VERSION:
+        raise ValueError(
+            "Checkpoint is not compatible with Chess RL v2; start fresh or use a v2 checkpoint"
+        )
+    if ckpt.get("model_config") != policy.config:
+        raise ValueError(
+            f"Checkpoint model config {ckpt.get('model_config')} does not match "
+            f"requested config {policy.config}"
+        )
+    for key in ("encoding_version", "action_version", "policy_size"):
+        if ckpt.get(key) != expected_metadata[key]:
+            raise ValueError(
+                f"Checkpoint {key}={ckpt.get(key)} does not match "
+                f"expected {expected_metadata[key]}"
+            )
     policy.load_state_dict(ckpt["policy_state_dict"])
     policy.to(device)
     if optimizer is not None and ckpt.get("optimizer_state_dict") is not None:
@@ -85,14 +142,45 @@ def load_checkpoint(path, policy, optimizer=None, device=None):
             for key, val in state.items():
                 if isinstance(val, torch.Tensor):
                     state[key] = val.to(device)
+    if scaler is not None and ckpt.get("scaler_state_dict") is not None:
+        scaler.load_state_dict(ckpt["scaler_state_dict"])
+    if ckpt.get("python_rng_state") is not None:
+        random.setstate(ckpt["python_rng_state"])
+    if ckpt.get("numpy_rng_state") is not None:
+        np.random.set_state(ckpt["numpy_rng_state"])
+    if ckpt.get("torch_rng_state") is not None:
+        cpu_state = ckpt["torch_rng_state"]
+        if isinstance(cpu_state, torch.Tensor):
+            cpu_state = cpu_state.detach().cpu().contiguous().to(torch.uint8)
+        torch.set_rng_state(cpu_state)
+    if torch.cuda.is_available() and ckpt.get("cuda_rng_state") is not None:
+        # map_location can strip ByteTensor typing; set_rng_state_all requires it.
+        try:
+            cuda_states = []
+            for state in ckpt["cuda_rng_state"]:
+                if isinstance(state, torch.Tensor):
+                    cuda_states.append(
+                        state.detach().cpu().contiguous().to(torch.uint8)
+                    )
+                else:
+                    cuda_states.append(
+                        torch.as_tensor(state, dtype=torch.uint8).contiguous()
+                    )
+            torch.cuda.set_rng_state_all(cuda_states)
+        except (RuntimeError, TypeError, ValueError) as exc:
+            print(f"Warning: could not restore CUDA RNG state ({exc}); continuing")
     return {
         "games_done": ckpt.get("games_done", 0),
         "results_window": ckpt.get("results_window", []),
+        "replay_path": ckpt.get("replay_path"),
+        "resolved_config": ckpt.get("resolved_config"),
     }
 
 
 def self_play_games_batch(policy, device, num_games, num_simulations, c_puct, temp_threshold,
                            dirichlet_alpha, dirichlet_eps, max_moves=200,
+                           avoid_training_repetitions=True,
+                           repetition_value_threshold=-0.25,
                            on_move=None, vis_index=None):
     """Play `num_games` self-play games concurrently (root parallelization).
 
@@ -102,8 +190,8 @@ def self_play_games_batch(policy, device, num_games, num_simulations, c_puct, te
     actually matters on a GPU, since a small network's single-position forward
     pass is dominated by launch overhead rather than compute.
 
-    Returns (boards, pis, outcomes, results, terminations): the first three
-    are training samples flattened across every game; `results` and
+    Returns compact v2 samples, value weights, results, terminations, and
+    lengths. The sample arrays are flattened across every game; `results` and
     `terminations` are one entry per game (len == num_games). `terminations`
     names why each game ended (e.g. "CHECKMATE", "THREEFOLD_REPETITION",
     "MOVE_CAP" for hitting the ply cap without a ruled game-over, or
@@ -112,7 +200,7 @@ def self_play_games_batch(policy, device, num_games, num_simulations, c_puct, te
     a move and should return False to stop every game immediately.
     """
     boards = [chess.Board() for _ in range(num_games)]
-    histories = [[] for _ in range(num_games)]  # per game: (board_before, pi, mover)
+    histories = [[] for _ in range(num_games)]  # (position, pi, mover)
     plies = [0] * num_games
     done = [False] * num_games
     results = [None] * num_games
@@ -129,12 +217,24 @@ def self_play_games_batch(policy, device, num_games, num_simulations, c_puct, te
 
         for root, i in zip(roots, active):
             temperature = 1.0 if plies[i] < temp_threshold else 0.0
+            excluded_moves = (
+                training_repetition_exclusions(
+                    root, value_threshold=repetition_value_threshold
+                )
+                if avoid_training_repetitions else set()
+            )
             # Store the temperature=1 (raw visit-count) distribution as the
             # training target regardless of temperature used to pick the move.
-            pi = policy_target(root, temperature=1.0)
-            move = select_move(root, temperature=temperature)
+            pi = policy_target(
+                root, temperature=1.0, excluded_moves=excluded_moves
+            )
+            move = select_move(
+                root, temperature=temperature, excluded_moves=excluded_moves
+            )
 
-            histories[i].append((boards[i].copy(), pi, boards[i].turn))
+            histories[i].append(
+                (PositionRecord.from_board(boards[i]), pi, boards[i].turn)
+            )
             boards[i].push(move)
             plies[i] += 1
 
@@ -152,17 +252,27 @@ def self_play_games_batch(policy, device, num_games, num_simulations, c_puct, te
                 done = [True] * num_games
                 break
 
-    boards_flat, pis_flat, outcomes_flat = [], [], []
+    positions_flat, pis_flat, outcomes_flat, value_weights_flat = [], [], [], []
     for i in range(num_games):
         # Move-cap or user-interrupted games are treated as drawn (no signal to learn).
         result = results[i] if results[i] is not None else "1/2-1/2"
         terminations[i] = terminations[i] or "INTERRUPTED"
-        for board_before, pi, mover in histories[i]:
-            boards_flat.append(board_before)
+        value_weight = 0.0 if terminations[i] in ("MOVE_CAP", "INTERRUPTED") else 1.0
+        for position, pi, mover in histories[i]:
+            positions_flat.append(position)
             pis_flat.append(pi)
             outcomes_flat.append(outcome_reward_for(result, mover))
+            value_weights_flat.append(value_weight)
 
-    return boards_flat, pis_flat, outcomes_flat, results, terminations
+    return (
+        positions_flat,
+        pis_flat,
+        outcomes_flat,
+        value_weights_flat,
+        results,
+        terminations,
+        plies,
+    )
 
 
 def train(
@@ -188,50 +298,38 @@ def train(
     buffer_capacity=50_000,
     train_batch_size=2048,
     min_buffer_size=1024,
+    avoid_training_repetitions=True,
+    repetition_value_threshold=-0.25,
+    base_lr=5e-4,
+    min_lr=5e-5,
+    warmup_games=2_000,
+    amp_enabled=True,
+    scaler=None,
+    replay_path=None,
+    replay_save_every=50,
+    checkpoint_keep=10,
+    resolved_config=None,
 ):
-    """
-    Train the policy AlphaZero-style: play `games_per_batch` self-play games
-    concurrently (root-parallel MCTS — see mcts_search_batch in mcts.py, which
-    batches every simulation round's leaf evaluations across all of them into
-    one forward pass), push the resulting (position, MCTS visit-count policy,
-    game outcome) samples into a replay buffer, then fit the network against
-    minibatches sampled from that buffer via alphazero_loss.
-
-    games_per_batch: self-play games run concurrently before each update
-    num_simulations: MCTS simulations run per move
-    c_puct: PUCT exploration constant used by MCTS's child selection
-    temp_threshold: plies per game before move sampling switches from the
-        visit-count distribution (temperature=1, exploration) to greedy
-        (temperature=0, exploitation); the stored training target always
-        uses the temperature=1 distribution regardless of the move actually played
-    dirichlet_alpha / dirichlet_eps: root exploration noise added during self-play
-    value_coef: weight on the value-head MSE term in alphazero_loss
-    epochs_per_batch: number of gradient-update passes per self-play batch, each
-        over a fresh minibatch sampled from the replay buffer
-    max_moves: ply cap per self-play game (treated as a draw if reached)
-    visualize: render the first game of each batch in the chess UI
-    move_delay: seconds to pause after each rendered move (visualized game only)
-    checkpoint_dir: directory for periodic checkpoints + latest.pt
-    checkpoint_every: save a checkpoint every N batches
-    start_games / results_window: for resuming a previous run
-    buffer_capacity: max samples kept in the replay buffer (oldest evicted first)
-    train_batch_size: samples drawn from the buffer per gradient update
-    min_buffer_size: skip training until the buffer holds at least this many
-        samples, so early updates aren't fit on a handful of positions
-    """
+    """Run versioned AlphaZero-style self-play and optimization."""
     policy.to(device)
     running = True
+    scaler = scaler or make_grad_scaler(amp_enabled)
 
-    if results_window is None:
-        results_window = deque(maxlen=100)
-    else:
-        results_window = deque(results_window, maxlen=100)
+    results_window = deque(results_window or [], maxlen=100)
     draw_reason_window = deque(maxlen=100)
 
     ckpt_dir = Path(checkpoint_dir)
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    replay_path = Path(replay_path or ckpt_dir / "replay_buffer.pt")
     games_done = start_games
     batch_idx = 0
     replay_buffer = ReplayBuffer(capacity=buffer_capacity)
+    if start_games and load_replay_buffer(replay_path, replay_buffer):
+        print(f"Restored replay buffer with {len(replay_buffer)} samples")
+    if resolved_config:
+        (ckpt_dir / "resolved_config.json").write_text(
+            json.dumps(resolved_config, indent=2, default=str), encoding="utf-8"
+        )
     run_start = time.time()
 
     while games_done < episodes and running:
@@ -256,7 +354,15 @@ def train(
                 time.sleep(move_delay)
             return running
 
-        all_boards, all_pis, all_outcomes, batch_results, batch_terminations = self_play_games_batch(
+        (
+            all_positions,
+            all_pis,
+            all_outcomes,
+            all_value_weights,
+            batch_results,
+            batch_terminations,
+            batch_lengths,
+        ) = self_play_games_batch(
             policy, device,
             num_games=batch_size,
             num_simulations=num_simulations,
@@ -265,6 +371,8 @@ def train(
             dirichlet_alpha=dirichlet_alpha,
             dirichlet_eps=dirichlet_eps,
             max_moves=max_moves,
+            avoid_training_repetitions=avoid_training_repetitions,
+            repetition_value_threshold=repetition_value_threshold,
             on_move=on_move if show else None,
             vis_index=0 if show else None,
         )
@@ -275,27 +383,26 @@ def train(
         games_done += batch_size
         batch_idx += 1
 
-        if all_boards:
-            replay_buffer.add(all_boards, all_pis, all_outcomes)
-
-            # Each epoch draws a fresh minibatch from the replay buffer, so
-            # updates see a mix of this batch and earlier games rather than
-            # repeatedly fitting the same freshly-played positions.
-            loss = None
+        if all_positions:
+            replay_buffer.add(
+                all_positions, all_pis, all_outcomes, all_value_weights
+            )
+            loss_metrics = None
+            lr = apply_lr_schedule(
+                optimizer, base_lr, min_lr, warmup_games, episodes, games_done
+            )
             if len(replay_buffer) >= min_buffer_size:
                 for _ in range(epochs_per_batch):
-                    sample_boards, sample_pis, sample_outcomes = replay_buffer.sample(
-                        train_batch_size
+                    sample = replay_buffer.sample(train_batch_size)
+                    loss_metrics = train_batch(
+                        policy,
+                        optimizer,
+                        scaler,
+                        *sample,
+                        value_coef=value_coef,
+                        device=device,
+                        amp_enabled=amp_enabled,
                     )
-                    outcomes_tensor = torch.tensor(sample_outcomes, dtype=torch.float32)
-
-                    optimizer.zero_grad()
-                    loss = policy.alphazero_loss(
-                        sample_boards, sample_pis, outcomes_tensor, value_coef=value_coef,
-                    )
-                    loss.backward()
-                    torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=1.0)
-                    optimizer.step()
 
             results_window.extend(batch_results)
             wins = results_window.count("1-0")
@@ -312,15 +419,26 @@ def train(
                 f"{reason}={count}" for reason, count in draw_reason_counts.most_common()
             ) or "n/a"
 
-            loss_str = f"{loss.item():.4f}" if loss is not None else "n/a (filling buffer)"
+            loss_str = (
+                f"{loss_metrics['total']:.4f} "
+                f"(p={loss_metrics['policy']:.4f}, v={loss_metrics['value']:.4f})"
+                if loss_metrics is not None else "n/a (filling buffer)"
+            )
+            grad_str = (
+                f"{loss_metrics['grad_norm']:.2f}"
+                if loss_metrics is not None else "n/a"
+            )
             batch_elapsed = time.time() - batch_start
             run_elapsed = time.time() - run_start
+            games_per_hour = (games_done - start_games) / max(run_elapsed / 3600, 1e-9)
             print(
                 f"[{time.strftime('%H:%M:%S')} | batch {batch_elapsed:.1f}s | "
                 f"total {run_elapsed / 60:.1f}m] "
                 f"Batch {batch_idx} | games {games_done}/{episodes} | "
                 f"loss={loss_str} | "
+                f"lr={lr:.2e} | grad={grad_str} | "
                 f"buffer={len(replay_buffer)}/{buffer_capacity} | "
+                f"{games_per_hour:.0f} games/h | avg_plies={sum(batch_lengths) / len(batch_lengths):.1f} | "
                 f"[last {n}: W{wins}/D{draws}/L{losses} "
                 f"white_win%={100 * wins / n:.0f}] | "
                 f"draws[last {len(draw_reason_window)}]: {draw_reason_str}"
@@ -328,29 +446,37 @@ def train(
 
         # Periodic checkpointing.
         if checkpoint_every and batch_idx % checkpoint_every == 0:
-            save_checkpoint(
-                ckpt_dir / f"ckpt_{games_done:06d}.pt",
-                policy,
-                optimizer,
-                games_done,
-                results_window,
-            )
-            save_checkpoint(
+            for checkpoint_path in (
+                ckpt_dir / f"ckpt_{games_done:07d}.pt",
                 ckpt_dir / "latest.pt",
-                policy,
-                optimizer,
-                games_done,
-                results_window,
-            )
+            ):
+                save_checkpoint(
+                    checkpoint_path,
+                    policy,
+                    optimizer,
+                    games_done,
+                    results_window,
+                    scaler=scaler,
+                    replay_path=replay_path,
+                    resolved_config=resolved_config,
+                )
+            numbered = sorted(ckpt_dir.glob("ckpt_*.pt"))
+            for stale in numbered[:-checkpoint_keep]:
+                stale.unlink()
             print(f"  ↳ checkpoint saved at {games_done} games")
+        if replay_save_every and batch_idx % replay_save_every == 0:
+            save_replay_buffer(replay_path, replay_buffer)
 
-    # Always save a final checkpoint on exit (also covers early window-close).
+    save_replay_buffer(replay_path, replay_buffer)
     save_checkpoint(
         ckpt_dir / "latest.pt",
         policy,
         optimizer,
         games_done,
         results_window,
+        scaler=scaler,
+        replay_path=replay_path,
+        resolved_config=resolved_config,
     )
 
     if visualize and chess_ui is not None:
@@ -401,7 +527,19 @@ def visualize_training(policy, device, games=3, move_delay=0.4):
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Train the RL chess policy.")
+    config_parser = argparse.ArgumentParser(add_help=False)
+    config_parser.add_argument(
+        "--config",
+        type=str,
+        default=str(DEFAULT_CONFIG_PATH),
+        help="YAML training configuration file",
+    )
+    config_args, _ = config_parser.parse_known_args()
+
+    parser = argparse.ArgumentParser(
+        description="Train the RL chess policy.",
+        parents=[config_parser],
+    )
     parser.add_argument("--episodes", type=int, default=1000,
                         help="total number of self-play games")
     parser.add_argument("--games-per-batch", type=int, default=4,
@@ -412,6 +550,10 @@ if __name__ == "__main__":
                         help="PUCT exploration constant")
     parser.add_argument("--temp-threshold", type=int, default=15,
                         help="plies before move selection switches from sampling to greedy")
+    parser.add_argument("--dirichlet-alpha", type=float, default=0.3,
+                        help="Dirichlet root-noise concentration")
+    parser.add_argument("--dirichlet-eps", type=float, default=0.25,
+                        help="fraction of root prior replaced by Dirichlet noise")
     parser.add_argument("--epochs-per-batch", type=int, default=2,
                         help="gradient-update passes per self-play batch, each over a "
                              "fresh minibatch sampled from the replay buffer")
@@ -425,8 +567,24 @@ if __name__ == "__main__":
                         help="skip training until the buffer holds at least this many samples")
     parser.add_argument("--max-moves", type=int, default=200,
                         help="ply cap per self-play game (treated as a draw if reached)")
+    parser.add_argument(
+        "--avoid-training-repetitions",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="exclude immediate third repetitions from non-losing self-play targets",
+    )
+    parser.add_argument("--repetition-value-threshold", type=float, default=-0.25)
     parser.add_argument("--lr", type=float, default=0.001,
-                        help="Adam learning rate")
+                        help="AdamW peak learning rate")
+    parser.add_argument("--min-lr", type=float, default=5e-5)
+    parser.add_argument("--warmup-games", type=int, default=2000)
+    parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument("--channels", type=int, default=96)
+    parser.add_argument("--num-blocks", type=int, default=8)
+    parser.add_argument("--value-head-channels", type=int, default=32)
+    parser.add_argument("--value-hidden", type=int, default=256)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--disable-amp", action="store_true")
     parser.add_argument("--no-visualize", action="store_true",
                         help="train headless (no pygame window)")
     parser.add_argument("--move-delay", type=float, default=0.1,
@@ -435,23 +593,63 @@ if __name__ == "__main__":
                         default=str(RL_DIR / "checkpoints"))
     parser.add_argument("--checkpoint-every", type=int, default=5,
                         help="save a checkpoint every N batches")
+    parser.add_argument("--checkpoint-keep", type=int, default=10)
+    parser.add_argument("--replay-save-every", type=int, default=50)
+    parser.add_argument("--replay-path", type=str, default=None)
     parser.add_argument("--resume", type=str, default=None,
                         help="path to a checkpoint to resume from")
     parser.add_argument("--model-out", type=str,
                         default=str(RL_DIR / "chess_rl_model.pt"),
                         help="where to save the final trained weights")
-    args = parser.parse_args()
 
-    policy = PolicyNetwork()
-    optimizer = torch.optim.Adam(policy.parameters(), lr=args.lr)
+    try:
+        config_defaults = load_training_config(config_args.config, "single_process")
+    except (FileNotFoundError, OSError, ValueError) as exc:
+        parser.error(str(exc))
+    valid_keys = {action.dest for action in parser._actions}
+    unknown_keys = sorted(set(config_defaults) - valid_keys)
+    if unknown_keys:
+        parser.error(f"unknown single-process config keys: {', '.join(unknown_keys)}")
+    parser.set_defaults(**config_defaults)
+    args = parser.parse_args()
+    if args.episodes < 0:
+        parser.error("--episodes must be non-negative")
+    if args.games_per_batch < 1:
+        parser.error("--games-per-batch must be at least 1")
+    if args.num_simulations < 1:
+        parser.error("--num-simulations must be at least 1")
+    if args.epochs_per_batch < 0:
+        parser.error("--epochs-per-batch must be non-negative")
+    if args.max_moves < 1:
+        parser.error("--max-moves must be at least 1")
+    if not 0.0 <= args.dirichlet_eps <= 1.0:
+        parser.error("--dirichlet-eps must be between 0 and 1")
+    if args.dirichlet_alpha <= 0:
+        parser.error("--dirichlet-alpha must be positive")
+
+    seed_everything(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
+    policy = PolicyNetwork(
+        channels=args.channels,
+        num_blocks=args.num_blocks,
+        value_head_channels=args.value_head_channels,
+        value_hidden=args.value_hidden,
+    )
+    optimizer = torch.optim.AdamW(
+        policy.parameters(), lr=args.lr, weight_decay=args.weight_decay
+    )
+    scaler = make_grad_scaler(not args.disable_amp and device.type == "cuda")
 
     start_games = 0
     results_window = None
     if args.resume:
-        meta = load_checkpoint(args.resume, policy, optimizer, device=device)
+        meta = load_checkpoint(
+            args.resume, policy, optimizer, device=device, scaler=scaler
+        )
         start_games = meta["games_done"]
         results_window = meta["results_window"]
+        if meta.get("replay_path"):
+            args.replay_path = meta["replay_path"]
         print(f"Resumed from {args.resume} at {start_games} games")
 
     policy = train(
@@ -463,9 +661,13 @@ if __name__ == "__main__":
         num_simulations=args.num_simulations,
         c_puct=args.c_puct,
         temp_threshold=args.temp_threshold,
+        dirichlet_alpha=args.dirichlet_alpha,
+        dirichlet_eps=args.dirichlet_eps,
         epochs_per_batch=args.epochs_per_batch,
         value_coef=args.value_coef,
         max_moves=args.max_moves,
+        avoid_training_repetitions=args.avoid_training_repetitions,
+        repetition_value_threshold=args.repetition_value_threshold,
         buffer_capacity=args.buffer_capacity,
         train_batch_size=args.train_batch_size,
         min_buffer_size=args.min_buffer_size,
@@ -473,10 +675,23 @@ if __name__ == "__main__":
         move_delay=args.move_delay,
         checkpoint_dir=args.checkpoint_dir,
         checkpoint_every=args.checkpoint_every,
+        checkpoint_keep=args.checkpoint_keep,
         start_games=start_games,
         results_window=results_window,
+        base_lr=args.lr,
+        min_lr=args.min_lr,
+        warmup_games=args.warmup_games,
+        amp_enabled=not args.disable_amp,
+        scaler=scaler,
+        replay_path=args.replay_path,
+        replay_save_every=args.replay_save_every,
+        resolved_config=vars(args),
     )
 
-    # Save just the final model weights (lighter than a full checkpoint).
-    torch.save(policy.state_dict(), args.model_out)
+    model_path = Path(args.model_out)
+    model_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {**policy.checkpoint_metadata(), "policy_state_dict": policy.state_dict()},
+        model_path,
+    )
     print(f"Final model weights saved to {args.model_out}")

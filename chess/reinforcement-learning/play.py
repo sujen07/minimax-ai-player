@@ -6,7 +6,8 @@ from pathlib import Path
 import chess
 import torch
 
-from model import PolicyNetwork
+from chess_environment import ACTION_VERSION, ENCODING_VERSION, POLICY_SIZE
+from model import MODEL_VERSION, PolicyNetwork
 from chess_environment import board_to_tensor, tensor_to_move
 
 CHESS_DIR = Path(__file__).resolve().parent.parent
@@ -20,10 +21,17 @@ import pygame  # noqa: E402
 
 
 def load_policy(model_path, device):
-    policy = PolicyNetwork()
-    ckpt = torch.load(model_path, map_location=device)
-    state_dict = ckpt["policy_state_dict"] if "policy_state_dict" in ckpt else ckpt
-    policy.load_state_dict(state_dict)
+    ckpt = torch.load(model_path, map_location=device, weights_only=False)
+    if ckpt.get("model_version") != MODEL_VERSION:
+        raise ValueError("This player requires a Chess RL v2 model")
+    if (
+        ckpt.get("encoding_version") != ENCODING_VERSION
+        or ckpt.get("action_version") != ACTION_VERSION
+        or ckpt.get("policy_size") != POLICY_SIZE
+    ):
+        raise ValueError("Model representation is incompatible with this player")
+    policy = PolicyNetwork(**ckpt["model_config"])
+    policy.load_state_dict(ckpt["policy_state_dict"])
     policy.to(device)
     policy.eval()
     return policy
@@ -139,7 +147,7 @@ def main():
 
     parser = argparse.ArgumentParser(description="Play chess against the trained RL policy.")
     parser.add_argument("--model-path", type=str,
-                         default=str(RL_DIR / "checkpoints" / "latest.pt"),
+                         default=str(RL_DIR / "checkpoints_v2" / "latest.pt"),
                          help="checkpoint (.pt) or raw state_dict to load")
     args = parser.parse_args()
 

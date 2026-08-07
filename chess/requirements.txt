@@ -3,3 +3,5 @@ PyYAML
 numpy
 python-chess
 torch
+zstandard
+matplotlib

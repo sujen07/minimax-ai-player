@@ -6,7 +6,7 @@ import yaml
 DEFAULT_CONFIG_PATH = Path(__file__).resolve().parent / "training_config.yaml"
 
 
-def load_training_config(path, section):
+def load_training_config(path, section, include_common=True):
     """Load and merge the common and entry-point-specific YAML settings."""
     config_path = Path(path)
     if not config_path.is_file():
@@ -18,7 +18,7 @@ def load_training_config(path, section):
     if not isinstance(config, dict):
         raise ValueError("Training config must contain a YAML mapping")
 
-    common = config.get("common", {})
+    common = config.get("common", {}) if include_common else {}
     specific = config.get(section, {})
     if not isinstance(common, dict) or not isinstance(specific, dict):
         raise ValueError("'common' and entry-point sections must be YAML mappings")
@@ -36,7 +36,14 @@ def load_training_config(path, section):
         for key, value in {**structured, **common, **specific}.items()
         if value is not None
     }
-    for key in ("checkpoint_dir", "resume", "model_out", "replay_path"):
+    for key in (
+        "checkpoint_dir",
+        "resume",
+        "model_out",
+        "replay_path",
+        "data_dir",
+        "plot_path",
+    ):
         if key in merged:
             value = Path(merged[key])
             if not value.is_absolute():

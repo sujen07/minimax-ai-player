@@ -4,3 +4,7 @@
 *.json
 *.csv
 *.pt
+
+data/
+
+.DS_Store

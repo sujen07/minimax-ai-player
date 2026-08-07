@@ -86,6 +86,34 @@ def train_batch(
     }
 
 
+@torch.no_grad()
+def eval_batch(
+    policy,
+    positions,
+    policies,
+    outcomes,
+    value_weights,
+    value_coef,
+    device,
+    amp_enabled,
+):
+    outcomes_tensor = torch.tensor(outcomes, dtype=torch.float32)
+    weights_tensor = torch.tensor(value_weights, dtype=torch.float32)
+    with amp_context(device, amp_enabled):
+        total_loss, policy_loss, value_loss = policy.alphazero_loss(
+            positions,
+            policies,
+            outcomes_tensor,
+            value_weights=weights_tensor,
+            value_coef=value_coef,
+        )
+    return {
+        "total": total_loss.detach().item(),
+        "policy": policy_loss.detach().item(),
+        "value": value_loss.detach().item(),
+    }
+
+
 def save_replay_buffer(path, replay_buffer):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)

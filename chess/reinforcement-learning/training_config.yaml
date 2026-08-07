@@ -52,3 +52,25 @@ single_process:
 multiprocess:
   # Leave null to use max(1, cpu_count() - 2).
   num_workers: null
+
+# Settings used only by train_supervised.py (does not merge `common`).
+supervised:
+  data_dir: data/lichess_sl
+  num_epochs: 10
+  val_fraction: 0.1
+  # Null → one full pass over the train split each epoch.
+  batches_per_epoch: null
+  checkpoint_dir: checkpoints_sl
+  checkpoint_every: 1
+  checkpoint_keep: 5
+  resume: null
+  model_out: chess_sl_model.pt
+  plot_path: checkpoints_sl/loss_curve.png
+  # Supervised runs usually want the full shard set in memory.
+  buffer_capacity: 1000000
+  train_batch_size: 512
+  value_coef: 1.0
+  lr: 0.0005
+  min_lr: 0.00005
+  warmup_games: 1
+  weight_decay: 0.0001

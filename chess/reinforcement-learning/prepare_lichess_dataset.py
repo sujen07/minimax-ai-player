@@ -18,7 +18,10 @@ from __future__ import annotations
 
 import argparse
 import io
+import ssl
 import sys
+import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -142,6 +145,72 @@ def open_pgn_stream(path: Path):
     return path.open("r", encoding="utf-8", errors="replace"), None
 
 
+def _ssl_context() -> ssl.SSLContext:
+    """HTTPS context that avoids the broken Windows cert-store load path.
+
+    On some Windows installs, ssl.create_default_context() fails while loading
+    the system store with ASN1: NOT_ENOUGH_DATA. Prefer certifi's CA bundle.
+    """
+    try:
+        import certifi
+    except ImportError as exc:
+        raise SystemExit(
+            "Downloading monthly dumps requires the 'certifi' package "
+            "(needed for a reliable HTTPS CA bundle on Windows).\n"
+            "  pip install certifi\n"
+            "Or download the dump yourself and pass --pgn <path>."
+        ) from exc
+
+    cafile = certifi.where()
+    try:
+        ctx = ssl.create_default_context(cafile=cafile)
+    except ssl.SSLError:
+        # Default construction can still touch the Windows store on some builds;
+        # build a clean context and load only certifi.
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.check_hostname = True
+        ctx.verify_mode = ssl.CERT_REQUIRED
+        ctx.load_verify_locations(cafile=cafile)
+    return ctx
+
+
+def _download_url(url: str, dest: Path, chunk_size: int = 8 * 1024 * 1024) -> None:
+    """Stream url to dest with MB progress, using a certifi-backed SSL context."""
+    req = urllib.request.Request(url, headers={"User-Agent": "minimax-ai-player/1.0"})
+    ctx = _ssl_context()
+    try:
+        with urllib.request.urlopen(req, context=ctx) as resp, dest.open("wb") as out:
+            total = resp.headers.get("Content-Length")
+            total_bytes = int(total) if total and total.isdigit() else None
+            downloaded = 0
+            last_report = time.monotonic()
+            while True:
+                chunk = resp.read(chunk_size)
+                if not chunk:
+                    break
+                out.write(chunk)
+                downloaded += len(chunk)
+                now = time.monotonic()
+                if now - last_report >= 2.0:
+                    mb = downloaded / (1024 * 1024)
+                    if total_bytes:
+                        pct = 100.0 * downloaded / total_bytes
+                        total_mb = total_bytes / (1024 * 1024)
+                        print(f"  … {mb:.0f} / {total_mb:.0f} MB ({pct:.1f}%)", flush=True)
+                    else:
+                        print(f"  … {mb:.0f} MB", flush=True)
+                    last_report = now
+    except urllib.error.URLError as exc:
+        cause = exc.reason if isinstance(exc.reason, BaseException) else exc
+        if isinstance(cause, ssl.SSLError) or "SSL" in str(exc):
+            raise SystemExit(
+                f"HTTPS download failed ({exc}).\n"
+                "Try: pip install --upgrade certifi\n"
+                "Or download the dump yourself and pass --pgn <path>."
+            ) from exc
+        raise
+
+
 def download_month(month: str, download_dir: Path) -> Path:
     download_dir.mkdir(parents=True, exist_ok=True)
     filename = f"lichess_db_standard_rated_{month}.pgn.zst"
@@ -155,7 +224,7 @@ def download_month(month: str, download_dir: Path) -> Path:
     print("Note: standard monthly dumps are large (often 15–30 GB compressed).")
     tmp = dest.with_suffix(dest.suffix + ".partial")
     try:
-        urllib.request.urlretrieve(url, tmp)
+        _download_url(url, tmp)
         tmp.replace(dest)
     except Exception:
         if tmp.exists():

@@ -48,10 +48,15 @@ single_process:
   no_visualize: true
   move_delay: 0.1
 
-# Settings used only by multiprocess_train.py.
+# Settings used only by multiprocess_train.py / multiprocess_train_v2.py.
 multiprocess:
   # Leave null to use max(1, cpu_count() - 2).
   num_workers: null
+  # Midgame self-play starts (from prepare_midgame_fens.py).
+  # midgame_fens: data/midgame_fens.pt
+  # midgame_prob: 0.7
+  midgame_fens: null
+  midgame_prob: 0.0
 
 # Settings used only by train_supervised.py (does not merge `common`).
 supervised:
